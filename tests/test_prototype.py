@@ -137,11 +137,67 @@ def test_fallback_from_verify(tmp_dir):
     ''')
 
 
+def test_watch(tmp_dir):
+    plan_file = write_file(tmp_dir / 'plan.yaml', dedent('''
+        blue:
+            prepare:
+                - run: echo blue-prepare >> TMP/log.txt
+            check:
+                - run: echo blue-check >> TMP/log.txt
+            activate:
+                - run: echo blue-activate >> TMP/log.txt
+            verify:
+                - run: echo blue-verify >> TMP/log.txt
+            done:
+                - run: echo blue-done >> TMP/log.txt
+        green:
+            prepare:
+                - run: echo green-prepare >> TMP/log.txt
+            check:
+                - run: echo green-check >> TMP/log.txt
+            activate:
+                - run: echo green-activate >> TMP/log.txt
+            verify:
+                - run: echo green-verify >> TMP/log.txt
+            done:
+                - run: echo green-done >> TMP/log.txt
+        state_file: TMP/state.yaml
+        watch:
+            files:
+                - TMP/stamp
+    ''').replace('TMP', str(tmp_dir)))
+    log_file = tmp_dir / 'log.txt'
+    status_file = tmp_dir / 'state.yaml'
+    write_file(tmp_dir / 'stamp', '')
+
+    # first run - should deploy blue
+
+    run_deploy(plan_file)
+    assert read_file(log_file) == dedent('''\
+        blue-prepare
+        blue-check
+        blue-activate
+        blue-verify
+        blue-done
+    ''')
+    assert yaml.load(read_file(status_file))['blue_status'] == 'active'
+
+    # second run - should do nothing
+
+    log_file.unlink()
+    run_deploy(plan_file)
+    assert not log_file.exists()
+    assert yaml.load(read_file(status_file))['blue_status'] == 'active'
+
+    assert 0
+
+
 # The prototype
 # -------------
 
 
 import logging
+from pathlib import Path
 import subprocess
 from time import monotonic as monotime
 import yaml
@@ -159,6 +215,11 @@ def run_deploy(plan_path):
         plan = yaml.safe_load(f)
     state_path = plan_path.parent / plan['state_file']
     with StateFile(state_path) as state_file:
+        if plan.get('watch'):
+            current_snapshot = WatchSnapshot(plan_path).capture(plan['watch'])
+            if snapshot_ok(current_snapshot, state_file.get('watch_snapshot')):
+                logger.info('No watched things have changed, not doing anything')
+                return
         branch = GREEN if state_file.get('blue_status') == 'active' else BLUE
         other_branch = GREEN if branch == BLUE else BLUE
         state_file[branch + '_status'] = 'preparing'
@@ -188,7 +249,61 @@ def run_deploy(plan_path):
         if state_file.get(other_branch + '_status') == 'active':
             state_file[other_branch + '_status'] = 'backup'
         state_file.flush()
+        if plan.get('watch'):
+            current_snapshot = WatchSnapshot(plan_path).capture(plan['watch'])
+            state_file['watch_snapshot'] = current_snapshot
+            state_file.flush()
         run_steps(plan[branch]['done'])
+
+
+class WatchSnapshot:
+
+    def __init__(self, base_path):
+        assert isinstance(base_path, Path)
+        self.base_path = base_path
+
+    def capture(self, watch_plan):
+        if not isinstance(watch_plan, dict):
+            raise Exception('Expected dict instead of {!r}'.format(watch_plan))
+        r = {}
+        if watch_plan.get('files'):
+            r['files'] = self.capture_files(watch_plan['files'])
+        return r
+
+    def capture_files(self, watch_files):
+        if not isinstance(watch_files, list):
+            raise Exception('Expected list instead of {!r}'.format(watch_files))
+        r = {}
+        for p in watch_files:
+            path = self.base_path / p
+            st = path.stat()
+            r[p] = {
+                'mtime': st.st_mtime,
+                'size': st.st_size,
+            }
+        return r
+
+
+def snapshot_ok(current, previous):
+    def r(a, b):
+        if not a and not b:
+            return True
+        if isinstance(a, dict) and isinstance(b, dict):
+            for k, v in a.items():
+                if not r(v, b.get(k)):
+                    return False
+            return True
+        return a == b
+    res = r(current, previous)
+    logger.debug('snapshot_ok(%r, %r) -> %r', current, previous, res)
+    return res
+
+
+assert snapshot_ok({'foo': 'bar'}, {'foo': 'bar'}) == True
+assert snapshot_ok({'foo': 'bar'}, {'foo': 'barx'}) == False
+assert snapshot_ok({'foo': 'bar'}, {}) == False
+assert snapshot_ok({'foo': 'bar'}, {'bar': 'baz'}) == False
+assert snapshot_ok({'foo': 'bar'}, {'foo': 'bar', 'bar': 'baz'}) == True
 
 
 class StateFile:
@@ -197,6 +312,7 @@ class StateFile:
         self._path = path
         self._content = self._read_file(self._path)
         self._data = yaml.safe_load(self._content or '') or {}
+        self._dirty = False
 
     def _read_file(self, path):
         try:
@@ -209,7 +325,8 @@ class StateFile:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        if self._dirty:
+            raise Exception('StateFile has some unsaved changes')
 
     def get(self, key):
         return self._data.get(key)
@@ -217,6 +334,7 @@ class StateFile:
     def __setitem__(self, key, value):
         logger.debug('State %s: %r -> %r', key, self._data.get(key), value)
         self._data[key] = value
+        self._dirty = True
 
     def flush(self):
         content = self._read_file(self._path)
@@ -230,7 +348,8 @@ class StateFile:
             f.write(new_content)
         temp_path.rename(self._path)
         self._content = new_content
-        logger.info('Saved state file %s', self._path)
+        logger.debug('Saved state file %s', self._path)
+        self._dirty = False
 
 
 def run_steps(steps):
