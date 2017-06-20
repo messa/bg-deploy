@@ -3,7 +3,9 @@ from pathlib import Path
 from pytest import fixture
 
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    format='~ %(name)s %(levelname)5s: %(message)s',
+    level=logging.DEBUG)
 
 
 @fixture
