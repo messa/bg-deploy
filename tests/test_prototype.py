@@ -79,6 +79,64 @@ def test_simple_workflow(tmp_dir):
     ''')
 
 
+def test_fallback_from_verify(tmp_dir):
+    plan_file = write_file(tmp_dir / 'plan.yaml', dedent('''
+        blue:
+            prepare:
+                - run: echo blue-prepare >> TMP/log.txt
+            check:
+                - run: echo blue-check >> TMP/log.txt
+            activate:
+                - run: echo blue-activate >> TMP/log.txt
+            verify:
+                - run: echo blue-verify >> TMP/log.txt
+            done:
+                - run: echo blue-done >> TMP/log.txt
+        green:
+            prepare:
+                - run: echo green-prepare >> TMP/log.txt
+            check:
+                - run: echo green-check >> TMP/log.txt
+            activate:
+                - run: echo green-activate >> TMP/log.txt
+            verify:
+                - run: echo green-verify failed >> TMP/log.txt && false
+            done:
+                - run: echo green-done >> TMP/log.txt
+        state_file: TMP/state.yaml
+    ''').replace('TMP', str(tmp_dir)))
+
+    # first run - should deploy blue
+
+    run_deploy(plan_file)
+    assert read_file(tmp_dir / 'state.yaml') == dedent('''\
+        blue_status: active
+    ''')
+
+    # second run - should try to deploy green, ten fallback to blue
+
+    run_deploy(plan_file)
+    assert read_file(tmp_dir / 'state.yaml') == dedent('''\
+        blue_status: active
+        green_status: activate-failed
+    ''')
+
+    assert read_file(tmp_dir / 'log.txt') == dedent('''\
+        blue-prepare
+        blue-check
+        blue-activate
+        blue-verify
+        blue-done
+        green-prepare
+        green-check
+        green-activate
+        green-verify failed
+        blue-activate
+        blue-verify
+        blue-done
+    ''')
+
+
 # The prototype
 # -------------
 
@@ -103,15 +161,34 @@ def run_deploy(plan_path):
     with StateFile(state_path) as state_file:
         branch = GREEN if state_file.get('blue_status') == 'active' else BLUE
         other_branch = GREEN if branch == BLUE else BLUE
-        run_steps(plan[branch]['prepare'])
-        run_steps(plan[branch]['check'])
-        run_steps(plan[branch]['activate'])
-        run_steps(plan[branch]['verify'])
-        run_steps(plan[branch]['done'])
+        state_file[branch + '_status'] = 'preparing'
+        state_file.flush()
+        try:
+            run_steps(plan[branch]['prepare'])
+            run_steps(plan[branch]['check'])
+        except BaseException as e:
+            state_file[branch + '_status'] = 'prepare-failed'
+            state_file.flush()
+            return
+        try:
+            run_steps(plan[branch]['activate'])
+            run_steps(plan[branch]['verify'])
+        except BaseException as e:
+            state_file[branch + '_status'] = 'activate-failed'
+            state_file.flush()
+            if state_file.get(other_branch + '_status') in ['active', 'backup']:
+                logger.info('Rollback to %s', other_branch)
+                run_steps(plan[other_branch]['activate'])
+                run_steps(plan[other_branch]['verify'])
+                run_steps(plan[other_branch]['done'])
+            else:
+                logger.info('Activate of %s failed, but %s not in state for rollback', branch, other_branch)
+            return
         state_file[branch + '_status'] = 'active'
         if state_file.get(other_branch + '_status') == 'active':
             state_file[other_branch + '_status'] = 'backup'
         state_file.flush()
+        run_steps(plan[branch]['done'])
 
 
 class StateFile:
@@ -138,6 +215,7 @@ class StateFile:
         return self._data.get(key)
 
     def __setitem__(self, key, value):
+        logger.debug('State %s: %r -> %r', key, self._data.get(key), value)
         self._data[key] = value
 
     def flush(self):
@@ -152,6 +230,7 @@ class StateFile:
             f.write(new_content)
         temp_path.rename(self._path)
         self._content = new_content
+        logger.info('Saved state file %s', self._path)
 
 
 def run_steps(steps):
